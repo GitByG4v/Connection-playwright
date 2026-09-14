@@ -6,12 +6,12 @@ COPY package*.json ./
 
 RUN npm install --omit=dev
 
+# Install Chromium and all required Linux dependencies
 RUN npx playwright install --with-deps chromium
 
 COPY server.js ./
 
 ENV NODE_ENV=production
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 EXPOSE 3000
 
