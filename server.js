@@ -10,14 +10,19 @@ const PORT = process.env.PORT || 3000;
 let browser = null;
 
 async function getBrowser() {
-  if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--disable-dev-shm-usage'
-      ]
-    });
+  if (browser && browser.isConnected()) {
+    return browser;
   }
+
+  browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    ]
+  });
 
   return browser;
 }
@@ -26,41 +31,44 @@ function cleanSku(value) {
   return String(value || '').trim();
 }
 
-function isValidConnectionProductUrl(url) {
+function isValidProductUrl(url) {
   try {
-    const parsed = new URL(url);
+    const u = new URL(url);
 
     return (
-      parsed.hostname === 'www.connection.com' &&
-      parsed.pathname.toLowerCase().startsWith('/product/')
+      u.hostname.toLowerCase() === 'www.connection.com' &&
+      u.pathname.toLowerCase().startsWith('/product/')
     );
   } catch {
     return false;
   }
 }
 
-function skuAppearsInProductUrl(url, sku) {
+function skuInUrl(url, sku) {
   try {
-    const parsed = new URL(url);
+    const u = new URL(url);
 
-    const path = decodeURIComponent(parsed.pathname).toLowerCase();
+    const path = decodeURIComponent(u.pathname).toLowerCase();
     const normalizedSku = sku.toLowerCase();
 
-    return path.includes(`/${normalizedSku}/`);
+    return (
+      path.includes(`/${normalizedSku}/`) ||
+      path.endsWith(`/${normalizedSku}`)
+    );
   } catch {
     return false;
   }
 }
 
 app.get('/', (req, res) => {
-  res.json({
+  res.status(200).json({
     service: 'connection-playwright',
     status: 'ok'
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({
+  res.status(200).json({
     status: 'ok'
   });
 });
@@ -75,17 +83,16 @@ app.post('/lookup', async (req, res) => {
     });
   }
 
-  if (sku.length > 100) {
-    return res.status(400).json({
-      success: false,
-      error: 'sku is too long'
-    });
-  }
+  const searchUrl =
+    `https://www.connection.com/IPA/Shop/Product/Search?SearchType=1&term=${encodeURIComponent(sku)}`;
 
   let context = null;
   let page = null;
 
   try {
+    console.log(`[LOOKUP] SKU: ${sku}`);
+    console.log(`[LOOKUP] URL: ${searchUrl}`);
+
     const browserInstance = await getBrowser();
 
     context = await browserInstance.newContext({
@@ -102,43 +109,78 @@ app.post('/lookup', async (req, res) => {
 
     page = await context.newPage();
 
-    const searchUrl =
-      `https://www.connection.com/IPA/Shop/Product/Search?SearchType=1&term=${encodeURIComponent(sku)}`;
+    page.on('response', response => {
+      const status = response.status();
 
-    await page.goto(searchUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000
+      if (status >= 400) {
+        console.log(
+          `[HTTP] ${status} ${response.url()}`
+        );
+      }
     });
 
-    // Give the redirect/client-side navigation a little time to complete.
-    await page.waitForTimeout(2500);
+    page.on('requestfailed', request => {
+      console.log(
+        `[REQUEST FAILED] ${request.url()} - ${request.failure()?.errorText}`
+      );
+    });
+
+    let gotoError = null;
+
+    try {
+      await page.goto(searchUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
+      });
+    } catch (error) {
+      gotoError = error.message;
+
+      console.log(
+        `[GOTO ERROR] ${gotoError}`
+      );
+    }
+
+    // Allow redirects/client-side navigation to settle.
+    await page.waitForTimeout(3000).catch(() => {});
 
     const finalUrl = page.url();
 
-    const validProductPage =
-      isValidConnectionProductUrl(finalUrl);
-
-    const skuMatch =
-      validProductPage &&
-      skuAppearsInProductUrl(finalUrl, sku);
-
     const title = await page.title().catch(() => '');
 
-    return res.json({
-      success: validProductPage && skuMatch,
+    const productPage = isValidProductUrl(finalUrl);
+
+    const skuMatch =
+      productPage &&
+      skuInUrl(finalUrl, sku);
+
+    console.log(`[FINAL URL] ${finalUrl}`);
+    console.log(`[TITLE] ${title}`);
+    console.log(`[PRODUCT PAGE] ${productPage}`);
+    console.log(`[SKU MATCH] ${skuMatch}`);
+
+    return res.status(200).json({
+      success: productPage && skuMatch,
       sku,
       searchUrl,
       finalUrl,
-      url: validProductPage && skuMatch ? finalUrl : null,
-      isProductPage: validProductPage,
+      url: productPage && skuMatch ? finalUrl : null,
+      title,
+      isProductPage: productPage,
       skuMatch,
-      title
+      gotoError
     });
 
   } catch (error) {
-    return res.status(502).json({
+    console.error('[LOOKUP ERROR]', error);
+
+    return res.status(200).json({
       success: false,
       sku,
+      searchUrl,
+      finalUrl: null,
+      url: null,
+      isProductPage: false,
+      skuMatch: false,
       error: error.message
     });
 
@@ -150,6 +192,18 @@ app.post('/lookup', async (req, res) => {
 });
 
 process.on('SIGTERM', async () => {
+  console.log('SIGTERM received');
+
+  if (browser) {
+    await browser.close().catch(() => {});
+  }
+
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received');
+
   if (browser) {
     await browser.close().catch(() => {});
   }
@@ -158,5 +212,7 @@ process.on('SIGTERM', async () => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Connection Playwright service running on port ${PORT}`);
+  console.log(
+    `Connection Playwright service listening on ${PORT}`
+  );
 });
