@@ -3,7 +3,7 @@ const { chromium } = require('playwright');
 
 const app = express();
 
-app.use(express.json({ limit: '50kb' }));
+app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
@@ -14,50 +14,22 @@ async function getBrowser() {
     return browser;
   }
 
+  console.log('[BROWSER] Starting Chromium...');
+
   browser = await chromium.launch({
     headless: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu'
+      '--disable-gpu',
+      '--no-zygote'
     ]
   });
 
+  console.log('[BROWSER] Chromium started');
+
   return browser;
-}
-
-function cleanSku(value) {
-  return String(value || '').trim();
-}
-
-function isValidProductUrl(url) {
-  try {
-    const u = new URL(url);
-
-    return (
-      u.hostname.toLowerCase() === 'www.connection.com' &&
-      u.pathname.toLowerCase().startsWith('/product/')
-    );
-  } catch {
-    return false;
-  }
-}
-
-function skuInUrl(url, sku) {
-  try {
-    const u = new URL(url);
-
-    const path = decodeURIComponent(u.pathname).toLowerCase();
-    const normalizedSku = sku.toLowerCase();
-
-    return (
-      path.includes(`/${normalizedSku}/`) ||
-      path.endsWith(`/${normalizedSku}`)
-    );
-  } catch {
-    return false;
-  }
 }
 
 app.get('/', (req, res) => {
@@ -73,8 +45,53 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/browser-test', async (req, res) => {
+  let context = null;
+
+  try {
+    console.log('[TEST] Launching browser');
+
+    const browserInstance = await getBrowser();
+
+    context = await browserInstance.newContext();
+
+    const page = await context.newPage();
+
+    await page.goto('https://example.com', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    });
+
+    const title = await page.title();
+
+    console.log('[TEST] Browser works');
+
+    return res.status(200).json({
+      success: true,
+      title,
+      url: page.url()
+    });
+
+  } catch (error) {
+
+    console.error('[TEST ERROR]', error);
+
+    return res.status(200).json({
+      success: false,
+      error: error.message,
+      stack: error.stack
+    });
+
+  } finally {
+    if (context) {
+      await context.close().catch(() => {});
+    }
+  }
+});
+
 app.post('/lookup', async (req, res) => {
-  const sku = cleanSku(req.body?.sku);
+
+  const sku = String(req.body?.sku || '').trim();
 
   if (!sku) {
     return res.status(400).json({
@@ -87,132 +104,177 @@ app.post('/lookup', async (req, res) => {
     `https://www.connection.com/IPA/Shop/Product/Search?SearchType=1&term=${encodeURIComponent(sku)}`;
 
   let context = null;
-  let page = null;
 
   try {
+
+    console.log('==============================');
     console.log(`[LOOKUP] SKU: ${sku}`);
     console.log(`[LOOKUP] URL: ${searchUrl}`);
 
     const browserInstance = await getBrowser();
+
+    console.log('[LOOKUP] Creating browser context');
 
     context = await browserInstance.newContext({
       viewport: {
         width: 1440,
         height: 900
       },
-      locale: 'en-US',
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-        'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-        'Chrome/131.0.0.0 Safari/537.36'
+      locale: 'en-US'
     });
 
-    page = await context.newPage();
-
-    page.on('response', response => {
-      const status = response.status();
-
-      if (status >= 400) {
-        console.log(
-          `[HTTP] ${status} ${response.url()}`
-        );
-      }
-    });
+    const page = await context.newPage();
 
     page.on('requestfailed', request => {
       console.log(
-        `[REQUEST FAILED] ${request.url()} - ${request.failure()?.errorText}`
+        '[REQUEST FAILED]',
+        request.url(),
+        request.failure()
       );
     });
 
-    let gotoError = null;
+    page.on('response', response => {
+
+      if (response.status() >= 400) {
+        console.log(
+          '[HTTP ERROR]',
+          response.status(),
+          response.url()
+        );
+      }
+
+    });
+
+    console.log('[LOOKUP] Opening Connection...');
+
+    let navigationError = null;
 
     try {
+
       await page.goto(searchUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 30000
       });
+
     } catch (error) {
-      gotoError = error.message;
+
+      navigationError = error.message;
 
       console.log(
-        `[GOTO ERROR] ${gotoError}`
+        '[NAVIGATION ERROR]',
+        navigationError
       );
+
     }
 
-    // Allow redirects/client-side navigation to settle.
-    await page.waitForTimeout(3000).catch(() => {});
+    console.log('[LOOKUP] Waiting for redirect...');
+
+    await page.waitForTimeout(5000);
 
     const finalUrl = page.url();
 
     const title = await page.title().catch(() => '');
 
-    const productPage = isValidProductUrl(finalUrl);
+    console.log('[LOOKUP] Final URL:', finalUrl);
+    console.log('[LOOKUP] Title:', title);
+
+    const isProductPage =
+      finalUrl
+        .toLowerCase()
+        .includes('connection.com/product/');
+
+    const decodedUrl =
+      decodeURIComponent(finalUrl).toLowerCase();
 
     const skuMatch =
-      productPage &&
-      skuInUrl(finalUrl, sku);
-
-    console.log(`[FINAL URL] ${finalUrl}`);
-    console.log(`[TITLE] ${title}`);
-    console.log(`[PRODUCT PAGE] ${productPage}`);
-    console.log(`[SKU MATCH] ${skuMatch}`);
+      decodedUrl.includes(
+        `/${sku.toLowerCase()}/`
+      ) ||
+      decodedUrl.endsWith(
+        `/${sku.toLowerCase()}`
+      );
 
     return res.status(200).json({
-      success: productPage && skuMatch,
+
+      success:
+        isProductPage &&
+        skuMatch,
+
       sku,
+
       searchUrl,
+
       finalUrl,
-      url: productPage && skuMatch ? finalUrl : null,
+
+      url:
+        isProductPage && skuMatch
+          ? finalUrl
+          : null,
+
       title,
-      isProductPage: productPage,
+
+      isProductPage,
+
       skuMatch,
-      gotoError
+
+      navigationError
+
     });
 
   } catch (error) {
-    console.error('[LOOKUP ERROR]', error);
+
+    console.error(
+      '[LOOKUP FATAL ERROR]',
+      error
+    );
 
     return res.status(200).json({
+
       success: false,
+
       sku,
+
       searchUrl,
+
       finalUrl: null,
+
       url: null,
+
       isProductPage: false,
+
       skuMatch: false,
-      error: error.message
+
+      error: error.message,
+
+      stack: error.stack
+
     });
 
   } finally {
+
     if (context) {
       await context.close().catch(() => {});
     }
+
   }
 });
 
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM received');
+
+  console.log('SIGTERM');
 
   if (browser) {
     await browser.close().catch(() => {});
   }
 
   process.exit(0);
-});
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received');
-
-  if (browser) {
-    await browser.close().catch(() => {});
-  }
-
-  process.exit(0);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
+
   console.log(
-    `Connection Playwright service listening on ${PORT}`
+    `Server listening on port ${PORT}`
   );
+
 });
