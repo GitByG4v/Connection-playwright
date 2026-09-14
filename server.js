@@ -1,16 +1,5 @@
 const express = require('express');
-
-// playwright-extra wraps Playwright's chromium launcher so puppeteer-extra
-// style plugins (like the stealth plugin) can be applied to it. This patches
-// the tell-tale signs of automation that bot-mitigation WAFs (Akamai/PerimeterX/etc.)
-// check for: navigator.webdriver, missing chrome.runtime, plugin/mimeType
-// arrays, WebGL vendor strings, permissions.query behavior, iframe.contentWindow,
-// and a handful of others. Without this, connection.com serves an
-// "Access Denied" block page instead of the real search redirect.
-const { chromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-
-chromium.use(StealthPlugin());
+const { chromium } = require('playwright');
 
 const app = express();
 
@@ -20,13 +9,15 @@ const PORT = process.env.PORT || 3000;
 
 let browser = null;
 
-// A realistic, current desktop Chrome UA. Playwright's default UA string is
-// fine on its own, but pinning it explicitly means it always matches the
-// Chromium version we actually launch (mismatches here are another common
-// bot-detection signal).
 const USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+  'Chrome/131.0.0.0 Safari/537.36';
+
+
+// ============================================================
+// BROWSER
+// ============================================================
 
 async function getBrowser() {
   if (browser && browser.isConnected()) {
@@ -37,15 +28,13 @@ async function getBrowser() {
 
   browser = await chromium.launch({
     headless: true,
+
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--no-zygote',
-      // Removes the "Chrome is being controlled by automated test software"
-      // banner and the associated automation flag some detectors check for.
-      '--disable-blink-features=AutomationControlled'
+      '--no-zygote'
     ]
   });
 
@@ -54,27 +43,121 @@ async function getBrowser() {
   return browser;
 }
 
-function isBlockedPage(title, finalUrl) {
-  const t = (title || '').toLowerCase();
-  return (
-    t.includes('access denied') ||
-    t.includes('are you a human') ||
-    t.includes('attention required') ||
-    t.includes('just a moment') || // Cloudflare interstitial
-    t.includes('robot') ||
-    (finalUrl || '').toLowerCase().includes('/error/')
+
+// ============================================================
+// BLOCK DETECTION
+// ============================================================
+
+function isBlockedPage(title, finalUrl, bodyText, html) {
+  const text = `
+    ${title || ''}
+    ${finalUrl || ''}
+    ${bodyText || ''}
+    ${html || ''}
+  `.toLowerCase();
+
+  const blockIndicators = [
+    'access denied',
+    "you don't have permission",
+    'you do not have permission',
+    'reference #',
+    'akamai',
+    'accessdenied',
+    'request blocked',
+    'request has been blocked',
+    'forbidden',
+    'security policy',
+    'bot detection',
+    'automated access',
+    'robot'
+  ];
+
+  return blockIndicators.some(indicator =>
+    text.includes(indicator)
   );
 }
 
+
+// ============================================================
+// PRODUCT URL VALIDATION
+// ============================================================
+
+function validateProductUrl(finalUrl, sku) {
+  if (!finalUrl || !sku) {
+    return {
+      isProductPage: false,
+      skuMatch: false,
+      valid: false
+    };
+  }
+
+  try {
+    const parsed = new URL(finalUrl);
+
+    const hostname = parsed.hostname.toLowerCase();
+
+    const pathname = decodeURIComponent(
+      parsed.pathname
+    ).toLowerCase();
+
+    const normalizedSku = decodeURIComponent(
+      sku
+    ).trim().toLowerCase();
+
+    const isConnection =
+      hostname === 'www.connection.com' ||
+      hostname === 'connection.com';
+
+    const isProductPage =
+      isConnection &&
+      pathname.startsWith('/product/');
+
+    /*
+      Connection product URLs normally look like:
+
+      /product/product-name/SKU/ITEMNUMBER
+
+      Example:
+
+      /product/monoprice-usb-2-a-m-to-micro-m-28-28awg/5137/41897940
+    */
+
+    const skuMatch =
+      pathname.includes(`/${normalizedSku}/`) ||
+      pathname.endsWith(`/${normalizedSku}`);
+
+    return {
+      isProductPage,
+      skuMatch,
+      valid: isProductPage && skuMatch
+    };
+
+  } catch (error) {
+    return {
+      isProductPage: false,
+      skuMatch: false,
+      valid: false
+    };
+  }
+}
+
+
+// ============================================================
+// SINGLE SKU LOOKUP
+// ============================================================
+
 async function runLookup(sku, attempt) {
+
   const searchUrl =
     `https://www.connection.com/IPA/Shop/Product/Search?SearchType=1&term=${encodeURIComponent(sku)}`;
 
   let context = null;
 
   try {
-    console.log('==============================');
-    console.log(`[LOOKUP] Attempt ${attempt} — SKU: ${sku}`);
+
+    console.log('========================================');
+    console.log(`[LOOKUP] Attempt ${attempt}`);
+    console.log(`[LOOKUP] SKU: ${sku}`);
     console.log(`[LOOKUP] URL: ${searchUrl}`);
 
     const browserInstance = await getBrowser();
@@ -82,203 +165,700 @@ async function runLookup(sku, attempt) {
     console.log('[LOOKUP] Creating browser context');
 
     context = await browserInstance.newContext({
-      viewport: { width: 1440, height: 900 },
+
+      viewport: {
+        width: 1440,
+        height: 900
+      },
+
       locale: 'en-US',
-      timezoneId: 'America/New_York',
+
       userAgent: USER_AGENT,
+
       extraHTTPHeaders: {
         'Accept-Language': 'en-US,en;q=0.9'
       }
+
     });
 
     const page = await context.newPage();
 
+
+    // --------------------------------------------------------
+    // REQUEST FAILURE LOGGING
+    // --------------------------------------------------------
+
     page.on('requestfailed', request => {
-      console.log('[REQUEST FAILED]', request.url(), request.failure());
+
+      console.log(
+        '[REQUEST FAILED]',
+        request.url(),
+        request.failure()
+      );
+
     });
 
+
+    // --------------------------------------------------------
+    // HTTP ERROR LOGGING
+    // --------------------------------------------------------
+
     page.on('response', response => {
+
       if (response.status() >= 400) {
-        console.log('[HTTP ERROR]', response.status(), response.url());
+
+        console.log(
+          '[HTTP ERROR]',
+          response.status(),
+          response.url()
+        );
+
       }
+
     });
+
 
     console.log('[LOOKUP] Opening Connection...');
 
+
+    // --------------------------------------------------------
+    // NAVIGATION
+    // --------------------------------------------------------
+
     let navigationError = null;
+    let mainResponse = null;
 
     try {
-      await page.goto(searchUrl, {
+
+      mainResponse = await page.goto(searchUrl, {
+
         waitUntil: 'domcontentloaded',
+
         timeout: 30000
+
       });
+
     } catch (error) {
+
       navigationError = error.message;
-      console.log('[NAVIGATION ERROR]', navigationError);
+
+      console.log(
+        '[NAVIGATION ERROR]',
+        navigationError
+      );
+
     }
 
-    console.log('[LOOKUP] Waiting for redirect...');
 
-    // A small human-like interaction before the wait — some bot checks key
-    // off zero mouse/scroll activity between navigation and read.
-    await page.mouse.move(200, 300);
+    // --------------------------------------------------------
+    // WAIT
+    // --------------------------------------------------------
+
+    console.log(
+      '[LOOKUP] Waiting for redirect...'
+    );
+
     await page.waitForTimeout(5000);
 
-    let finalUrl = page.url();
-    let title = await page.title().catch(() => '');
 
-    console.log('[LOOKUP] Final URL:', finalUrl);
-    console.log('[LOOKUP] Title:', title);
+    // --------------------------------------------------------
+    // BASIC PAGE INFORMATION
+    // --------------------------------------------------------
 
-    const blocked = isBlockedPage(title, finalUrl);
+    const finalUrl = page.url();
 
-    if (blocked) {
-      return {
-        blocked: true,
-        sku,
-        searchUrl,
-        finalUrl,
-        title,
-        navigationError
-      };
-    }
+    const title = await page
+      .title()
+      .catch(() => '');
 
-    const isProductPage =
-      finalUrl.toLowerCase().includes('connection.com/product/');
 
-    const decodedUrl = decodeURIComponent(finalUrl).toLowerCase();
+    // --------------------------------------------------------
+    // BODY
+    // --------------------------------------------------------
 
-    const skuMatch =
-      decodedUrl.includes(`/${sku.toLowerCase()}/`) ||
-      decodedUrl.endsWith(`/${sku.toLowerCase()}`);
+    const bodyText = await page
+      .locator('body')
+      .innerText()
+      .catch(() => '');
 
-    const success = isProductPage && skuMatch;
+
+    // --------------------------------------------------------
+    // HTML
+    // --------------------------------------------------------
+
+    const html = await page
+      .content()
+      .catch(() => '');
+
+
+    // --------------------------------------------------------
+    // RESPONSE INFORMATION
+    // --------------------------------------------------------
+
+    const httpStatus = mainResponse
+      ? mainResponse.status()
+      : null;
+
+    const contentType = mainResponse
+      ? mainResponse.headers()['content-type'] || null
+      : null;
+
+
+    console.log(
+      '[LOOKUP] HTTP STATUS:',
+      httpStatus
+    );
+
+    console.log(
+      '[LOOKUP] CONTENT TYPE:',
+      contentType
+    );
+
+    console.log(
+      '[LOOKUP] Final URL:',
+      finalUrl
+    );
+
+    console.log(
+      '[LOOKUP] Title:',
+      title
+    );
+
+
+    console.log(
+      '[LOOKUP] Body preview:',
+      bodyText.substring(0, 1000)
+    );
+
+
+    console.log(
+      '[LOOKUP] HTML preview:',
+      html.substring(0, 1500)
+    );
+
+
+    // --------------------------------------------------------
+    // BLOCK DETECTION
+    // --------------------------------------------------------
+
+    const blocked = isBlockedPage(
+      title,
+      finalUrl,
+      bodyText,
+      html
+    );
+
+
+    console.log(
+      '[LOOKUP] Blocked:',
+      blocked
+    );
+
+
+    // --------------------------------------------------------
+    // PRODUCT URL VALIDATION
+    // --------------------------------------------------------
+
+    const validation = validateProductUrl(
+      finalUrl,
+      sku
+    );
+
+
+    console.log(
+      '[LOOKUP] Product page:',
+      validation.isProductPage
+    );
+
+    console.log(
+      '[LOOKUP] SKU match:',
+      validation.skuMatch
+    );
+
+
+    // --------------------------------------------------------
+    // FINAL SUCCESS
+    // --------------------------------------------------------
+
+    const success =
+      !blocked &&
+      validation.valid;
+
+
+    console.log(
+      '[LOOKUP] SUCCESS:',
+      success
+    );
+
+
+    // --------------------------------------------------------
+    // MARKDOWN LINK
+    // --------------------------------------------------------
+
+    const markdownLink =
+      success && title
+        ? `[${title}](${finalUrl})`
+        : success
+          ? `[Connection Product](${finalUrl})`
+          : null;
+
+
+    // --------------------------------------------------------
+    // RETURN RESULT
+    // --------------------------------------------------------
 
     return {
-      blocked: false,
+
+      blocked,
+
       success,
+
       sku,
+
       searchUrl,
+
       finalUrl,
-      url: success ? finalUrl : null,
+
+      url: success
+        ? finalUrl
+        : null,
+
       title,
-      isProductPage,
-      skuMatch,
+
+      httpStatus,
+
+      contentType,
+
+      isProductPage:
+        validation.isProductPage,
+
+      skuMatch:
+        validation.skuMatch,
+
+      markdownLink,
+
       navigationError,
-      // e.g. "[Monoprice USB 2 A M TO MICRO M 28 28AWG (5137 )](https://www.connection.com/product/.../5137/41897940?cac=Result)"
-      markdownLink: success && title ? `[${title}](${finalUrl})` : null
+
+      bodyPreview:
+        bodyText.substring(0, 1000)
+
     };
 
+
   } finally {
+
     if (context) {
-      await context.close().catch(() => {});
+
+      await context
+        .close()
+        .catch(() => {});
+
     }
+
   }
+
 }
 
+
+// ============================================================
+// ROOT
+// ============================================================
+
 app.get('/', (req, res) => {
-  res.status(200).json({ service: 'connection-playwright', status: 'ok' });
+
+  res.status(200).json({
+
+    service: 'connection-playwright',
+
+    status: 'ok'
+
+  });
+
 });
+
+
+// ============================================================
+// HEALTH
+// ============================================================
 
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
+
+  res.status(200).json({
+
+    status: 'ok'
+
+  });
+
 });
 
+
+// ============================================================
+// BROWSER TEST
+// ============================================================
+
 app.get('/browser-test', async (req, res) => {
+
   let context = null;
 
   try {
-    const browserInstance = await getBrowser();
-    context = await browserInstance.newContext({ userAgent: USER_AGENT });
-    const page = await context.newPage();
 
-    await page.goto('https://example.com', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000
+    console.log(
+      '[TEST] Launching browser'
+    );
+
+    const browserInstance =
+      await getBrowser();
+
+    context =
+      await browserInstance.newContext({
+
+        viewport: {
+          width: 1440,
+          height: 900
+        },
+
+        locale: 'en-US',
+
+        userAgent: USER_AGENT
+
+      });
+
+
+    const page =
+      await context.newPage();
+
+
+    await page.goto(
+      'https://example.com',
+      {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
+      }
+    );
+
+
+    const title =
+      await page.title();
+
+
+    console.log(
+      '[TEST] Browser works'
+    );
+
+
+    return res.status(200).json({
+
+      success: true,
+
+      title,
+
+      url: page.url()
+
     });
 
-    const title = await page.title();
-
-    return res.status(200).json({ success: true, title, url: page.url() });
 
   } catch (error) {
-    console.error('[TEST ERROR]', error);
-    return res
-      .status(200)
-      .json({ success: false, error: error.message, stack: error.stack });
+
+    console.error(
+      '[TEST ERROR]',
+      error
+    );
+
+
+    return res.status(200).json({
+
+      success: false,
+
+      error: error.message,
+
+      stack: error.stack
+
+    });
+
 
   } finally {
+
     if (context) {
-      await context.close().catch(() => {});
+
+      await context
+        .close()
+        .catch(() => {});
+
     }
+
   }
+
 });
+
+
+// ============================================================
+// LOOKUP API
+// ============================================================
 
 app.post('/lookup', async (req, res) => {
 
-  const sku = String(req.body?.sku || '').trim();
+  const sku =
+    String(
+      req.body?.sku || ''
+    ).trim();
+
 
   if (!sku) {
-    return res.status(400).json({ success: false, error: 'sku is required' });
+
+    return res.status(400).json({
+
+      success: false,
+
+      error: 'sku is required'
+
+    });
+
   }
+
 
   try {
-    let result = await runLookup(sku, 1);
 
-    // If the WAF blocked the first attempt, retry once with a brand-new
-    // context (fresh cookies/fingerprint) rather than immediately failing.
-    if (result.blocked) {
-      console.log('[LOOKUP] Blocked on attempt 1, retrying...');
-      await new Promise(r => setTimeout(r, 2000));
-      result = await runLookup(sku, 2);
-    }
+    // --------------------------------------------------------
+    // ATTEMPT 1
+    // --------------------------------------------------------
 
-    if (result.blocked) {
-      return res.status(200).json({
-        success: false,
+    let result =
+      await runLookup(
         sku,
-        searchUrl: result.searchUrl,
-        finalUrl: result.finalUrl,
-        url: null,
-        title: result.title,
-        isProductPage: false,
-        skuMatch: false,
-        markdownLink: null,
-        navigationError: result.navigationError,
-        error: 'Blocked by site bot-protection after retry'
-      });
+        1
+      );
+
+
+    // --------------------------------------------------------
+    // RETRY ONLY FOR TEMPORARY NAVIGATION FAILURE
+    // --------------------------------------------------------
+
+    if (
+      !result.success &&
+      !result.blocked &&
+      result.navigationError
+    ) {
+
+      console.log(
+        '[LOOKUP] Navigation failed on attempt 1'
+      );
+
+      console.log(
+        '[LOOKUP] Retrying...'
+      );
+
+
+      await new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+            2000
+          )
+      );
+
+
+      result =
+        await runLookup(
+          sku,
+          2
+        );
+
     }
 
-    const { blocked, ...payload } = result;
-    return res.status(200).json(payload);
 
-  } catch (error) {
-    console.error('[LOOKUP FATAL ERROR]', error);
+    // --------------------------------------------------------
+    // BLOCKED RESPONSE
+    // --------------------------------------------------------
+
+    if (result.blocked) {
+
+      console.log(
+        '[LOOKUP] Connection returned a blocked response'
+      );
+
+
+      return res.status(200).json({
+
+        success: false,
+
+        sku,
+
+        searchUrl:
+          result.searchUrl,
+
+        finalUrl:
+          result.finalUrl,
+
+        url: null,
+
+        title:
+          result.title,
+
+        httpStatus:
+          result.httpStatus,
+
+        contentType:
+          result.contentType,
+
+        isProductPage: false,
+
+        skuMatch: false,
+
+        markdownLink: null,
+
+        navigationError:
+          result.navigationError,
+
+        bodyPreview:
+          result.bodyPreview,
+
+        error:
+          'Connection returned a blocked/access-denied response'
+
+      });
+
+    }
+
+
+    // --------------------------------------------------------
+    // NORMAL RESPONSE
+    // --------------------------------------------------------
 
     return res.status(200).json({
+
+      success:
+        result.success,
+
+      sku:
+        result.sku,
+
+      searchUrl:
+        result.searchUrl,
+
+      finalUrl:
+        result.finalUrl,
+
+      url:
+        result.url,
+
+      title:
+        result.title,
+
+      httpStatus:
+        result.httpStatus,
+
+      contentType:
+        result.contentType,
+
+      isProductPage:
+        result.isProductPage,
+
+      skuMatch:
+        result.skuMatch,
+
+      markdownLink:
+        result.markdownLink,
+
+      navigationError:
+        result.navigationError,
+
+      bodyPreview:
+        result.bodyPreview,
+
+      error:
+        result.success
+          ? null
+          : 'Connection search did not resolve to a valid product URL'
+
+    });
+
+
+  } catch (error) {
+
+    console.error(
+      '[LOOKUP FATAL ERROR]',
+      error
+    );
+
+
+    return res.status(200).json({
+
       success: false,
+
       sku,
+
       searchUrl:
         `https://www.connection.com/IPA/Shop/Product/Search?SearchType=1&term=${encodeURIComponent(sku)}`,
+
       finalUrl: null,
+
       url: null,
+
+      title: null,
+
+      httpStatus: null,
+
+      contentType: null,
+
       isProductPage: false,
+
       skuMatch: false,
+
       markdownLink: null,
-      error: error.message,
-      stack: error.stack
+
+      error:
+        error.message,
+
+      stack:
+        error.stack
+
     });
+
   }
+
 });
 
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM');
-  if (browser) {
-    await browser.close().catch(() => {});
-  }
-  process.exit(0);
-});
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+// ============================================================
+// SHUTDOWN
+// ============================================================
+
+process.on(
+  'SIGTERM',
+  async () => {
+
+    console.log(
+      'SIGTERM'
+    );
+
+
+    if (browser) {
+
+      await browser
+        .close()
+        .catch(() => {});
+
+    }
+
+
+    process.exit(0);
+
+  }
+);
+
+
+// ============================================================
+// START SERVER
+// ============================================================
+
+app.listen(
+  PORT,
+  '0.0.0.0',
+  () => {
+
+    console.log(
+      `Server listening on port ${PORT}`
+    );
+
+  }
+);
