@@ -1,10 +1,12 @@
-FROM mcr.microsoft.com/playwright:v1.63.0-noble
+FROM node:20-bookworm
 
 WORKDIR /app
 
 COPY package*.json ./
 
 RUN npm install --omit=dev
+
+RUN npx playwright install --with-deps chromium
 
 COPY server.js ./
 
